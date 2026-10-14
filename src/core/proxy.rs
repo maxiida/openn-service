@@ -102,7 +102,26 @@ fn apply_real(config: &MacosProxyConfig) -> anyhow::Result<()> {
             },
         ),
     };
-    sysproxy::apply_privileged_native(&system, &auto).map_err(Into::into)
+    retry_while_preferences_locked(|| sysproxy::apply_privileged_native(&system, &auto)).map_err(Into::into)
+}
+
+/// sysproxy takes the preferences lock without waiting, so a concurrent writer such as the app's
+/// `networksetup` DNS scripts or an overlapping apply makes a single attempt fail spuriously.
+#[cfg(target_os = "macos")]
+fn retry_while_preferences_locked(mut apply: impl FnMut() -> sysproxy::Result<()>) -> sysproxy::Result<()> {
+    const ATTEMPTS: u32 = 40;
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut attempt = 1;
+    loop {
+        match apply() {
+            Err(sysproxy::Error::SystemConfiguration("lock preferences")) if attempt < ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(INTERVAL);
+            }
+            result => return result,
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -162,12 +181,17 @@ pub async fn clear_proxy() -> anyhow::Result<()> {
     }
 }
 
+/// A primary service absent from the saved preferences (a VPN's dynamic service, or one mid
+/// teardown) holds no proxy settings we could have written, so it counts as no service at all.
 #[cfg(target_os = "macos")]
 fn is_no_active_network_service(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<sysproxy::Error>(),
-            Some(sysproxy::Error::NoActiveNetworkService)
+            Some(
+                sysproxy::Error::NoActiveNetworkService
+                    | sysproxy::Error::SystemConfiguration("resolve active network service")
+            )
         )
     })
 }
@@ -345,16 +369,23 @@ mod tests {
             port: 7897,
             bypass: String::new(),
         };
-        let mut calls = Vec::new();
+        // The second case aborted core start with code 1010 before it counted as a missing service.
+        let missing_services: [fn() -> sysproxy::Error; 2] = [
+            || sysproxy::Error::NoActiveNetworkService,
+            || sysproxy::Error::SystemConfiguration("resolve active network service"),
+        ];
+        for missing in missing_services {
+            let mut calls = Vec::new();
 
-        let outcome = apply_proxy_or_direct_with(Some(&config), |config| {
-            calls.push(config.clone());
-            Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService))
-        })
-        .unwrap();
+            let outcome = apply_proxy_or_direct_with(Some(&config), |config| {
+                calls.push(config.clone());
+                Err(anyhow::Error::new(missing()))
+            })
+            .unwrap();
 
-        assert!(matches!(outcome, ProxyApplyOutcome::DirectFallback { .. }));
-        assert_eq!(calls, [config, MacosProxyConfig::Disabled]);
+            assert!(matches!(outcome, ProxyApplyOutcome::DirectFallback { .. }));
+            assert_eq!(calls, [config.clone(), MacosProxyConfig::Disabled]);
+        }
     }
 
     #[cfg(target_os = "macos")]
